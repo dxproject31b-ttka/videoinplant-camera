@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Secure Camera Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fix-webm-duration@1.0.6/fix-webm-duration.js"></script>
+    <style>
+        :root { --app-height: 100vh; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #060814;
+            color: #f8fafc;
+            height: var(--app-height);
+        }
+    </style>
+</head>
+<body class="overflow-hidden flex flex-col justify-between p-4">
+
+    <!-- Landscape Guidance HUD -->
+    <div id="landscapeHUD" class="hidden bg-orange-950/90 text-orange-200 border border-orange-600 p-2 text-center text-[10px] rounded-lg absolute top-4 left-4 right-4 z-50 animate-pulse">
+        📐 กรุณาหมุนโทรศัพท์แนวนอนเพื่อขยายขอบเขตทัศนวิสัยกล้องสูงสุด
+    </div>
+
+    <!-- Screen Preview -->
+    <div class="flex-grow w-full rounded-2xl bg-black overflow-hidden relative border border-slate-800 shadow-2xl">
+        <video id="viewfinder" autoplay muted playsinline class="w-full h-full object-cover"></video>
+        <video id="playback" controls playsinline class="hidden w-full h-full object-contain"></video>
+        <div id="counter" class="hidden absolute top-4 right-4 px-3 py-1 bg-red-600 text-white font-mono text-xs font-bold rounded-lg tracking-widest">00:00</div>
+    </div>
+
+    <!-- Bottom Controls -->
+    <div class="w-full mt-4 flex items-center justify-around">
+        <div class="flex gap-4 w-full justify-center" id="panel-record">
+            <button id="btnStart" onclick="executeRecording()" class="px-6 py-4 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold text-xs uppercase tracking-wider shadow-lg active:scale-95 transition-all">
+                ⏺️ เริ่มบันทึก (Start)
+            </button>
+            <button id="btnStop" disabled onclick="ceaseRecording()" class="px-6 py-4 bg-rose-600 hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl font-bold text-xs uppercase tracking-wider shadow-lg active:scale-95 transition-all">
+                🛑 จบงานบันทึก (Stop)
+            </button>
+        </div>
+
+        <div class="flex gap-4 w-full justify-center hidden" id="panel-review">
+            <button onclick="retakeMedia()" class="px-6 py-4 bg-slate-700 hover:bg-slate-600 rounded-xl font-bold text-xs uppercase tracking-wider shadow-lg active:scale-95 transition-all">
+                🔄 อัดวิดีโอใหม่
+            </button>
+            <button id="btnConfirm" onclick="dispatchTelemetry()" class="px-6 py-4 bg-orange-600 hover:bg-orange-500 rounded-xl font-bold text-xs uppercase tracking-wider shadow-lg active:scale-95 transition-all">
+                🚀 โอนข้อมูลข้ามโดเมน
+            </button>
+        </div>
+    </div>
+
+    <script>
+        let stream = null;
+        let mediaRecorder = null;
+        let chunks = [];
+        let recordedBlob = null;
+        let recordingStartTime = 0;
+        let countdownTimer = null;
+        let activeCoords = null;
+
+        const params = new URLSearchParams(window.location.search);
+        const filename = params.get('filename') || `driver_plant_${Date.now()}.webm`;
+
+        // 1. Dynamic Viewport & Mathematical Landscape Calculations
+        function calculateScreenDimen() {
+            document.documentElement.style.setProperty('--app-height', `${window.innerHeight}px`);
+            const hud = document.getElementById("landscapeHUD");
+            if (window.innerWidth > window.innerHeight) {
+                document.body.classList.add("is-landscape");
+                hud.classList.add("hidden");
+            } else {
+                document.body.classList.remove("is-landscape");
+                hud.classList.remove("hidden");
+            }
+        }
+        window.addEventListener("resize", () => setTimeout(calculateScreenDimen, 150));
+        window.addEventListener("orientationchange", () => setTimeout(calculateScreenDimen, 150));
+        calculateScreenDimen();
+
+        // 2. High-Accuracy Geolocation Retrieval
+        function fetchGeolocation() {
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        activeCoords = {
+                            lat: pos.coords.latitude,
+                            lng: pos.coords.longitude
+                        };
+                        console.log("GPS Coordinates Bound: ", activeCoords);
+                    },
+                    (err) => console.log("GPS Denied: ", err.message),
+                    { enableHighAccuracy: true, timeout: 10000 }
+                );
+            }
+        }
+
+        // 3. Setup Hardware Camera Access
+        async function setupCamera() {
+            try {
+                // ดึงพิกัดคู่ขนานกันไปเพื่อความรวดเร็ว
+                fetchGeolocation();
+                
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: true,
+                    video: {
+                        facingMode: "environment",
+                        width: { ideal: 640 },
+                        height: { ideal: 360 },
+                        frameRate: { ideal: 24 }
+                    }
+                });
+                document.getElementById("viewfinder").srcObject = stream;
+            } catch (e) {
+                alert("สิทธิ์กล้องถูกระงับ: บังคับย้ายไปใช้งาน Native OS UI Capture");
+                nativeOSCaptureFallback();
+            }
+        }
+
+        // 4. Native OS Web-API Video Capture Fallback (Bypasses Canvas Blockers on legacy Safari)
+        function nativeOSCaptureFallback() {
+            const fallbackInput = document.createElement("input");
+            fallbackInput.type = "file";
+            fallbackInput.accept = "video/*";
+            fallbackInput.capture = "environment";
+            fallbackInput.className = "hidden";
+            fallbackInput.onchange = (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    recordedBlob = file;
+                    renderPlaybackUI(true);
+                }
+            };
+            document.body.appendChild(fallbackInput);
+            fallbackInput.click();
+        }
+
+        function executeRecording() {
+            chunks = [];
+            // ดักสภาวะแวดล้อม iOS เพื่อสลับ Codec สู่รูปแบบที่เหมาะสมที่สุด
+            let options = { mimeType: 'video/webm;codecs=vp9', videoBitsPerSecond: 1000000 };
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                options = { mimeType: 'video/webm', videoBitsPerSecond: 1000000 };
+            }
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                // Fallback สำหรับ iOS และอุปกรณ์ดั้งเดิมที่ไม่รองรับ WebM
+                options = { mimeType: 'video/mp4', videoBitsPerSecond: 1000000 };
+            }
+
+            mediaRecorder = new MediaRecorder(stream, options);
+            mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+            mediaRecorder.onstop = () => {
+                const mime = options.mimeType;
+                const rawBlob = new Blob(chunks, { type: mime });
+                const elapsed = Date.now() - recordingStartTime;
+                
+                if (mime.includes("webm") && typeof ysFixWebmDuration !== 'undefined') {
+                    ysFixWebmDuration(rawBlob, elapsed, function(fixedBlob) {
+                        recordedBlob = fixedBlob;
+                        renderPlaybackUI();
+                    });
+                } else {
+                    recordedBlob = rawBlob;
+                    renderPlaybackUI();
+                }
+            };
+
+            mediaRecorder.start();
+            recordingStartTime = Date.now();
+            document.getElementById("btnStart").disabled = true;
+            document.getElementById("btnStop").disabled = false;
+            
+            // จำกัดการอัดวิดีโอไม่เกิน 5 นาที ป้องกันอาการ Crash ของ RAM หน้าเครื่องพนักงาน
+            document.getElementById("counter").classList.remove("hidden");
+            countdownTimer = setInterval(() => {
+                const elapsedSeconds = Math.round((Date.now() - recordingStartTime) / 1000);
+                const mm = String(Math.floor(elapsedSeconds / 60)).padStart(2, '0');
+                const ss = String(elapsedSeconds % 60).padStart(2, '0');
+                document.getElementById("counter").textContent = `${mm}:${ss}`;
+                if (elapsedSeconds >= 300) {
+                    ceaseRecording();
+                }
+            }, 1000);
+        }
+
+        function ceaseRecording() {
+            if (mediaRecorder && mediaRecorder.state !== "inactive") {
+                mediaRecorder.stop();
+            }
+            clearInterval(countdownTimer);
+            document.getElementById("counter").classList.add("hidden");
+        }
+
+        function renderPlaybackUI(isFallback = false) {
+            document.getElementById("viewfinder").classList.add("hidden");
+            const playback = document.getElementById("playback");
+            playback.classList.remove("hidden");
+            playback.src = URL.createObjectURL(recordedBlob);
+            
+            document.getElementById("panel-record").classList.add("hidden");
+            document.getElementById("panel-review").classList.remove("hidden");
+            
+            if (stream && !isFallback) {
+                stream.getTracks().forEach(t => t.stop());
+            }
+        }
+
+        function retakeMedia() {
+            document.getElementById("playback").classList.add("hidden");
+            document.getElementById("viewfinder").classList.remove("hidden");
+            document.getElementById("panel-record").classList.remove("hidden");
+            document.getElementById("panel-review").classList.add("hidden");
+            document.getElementById("btnStart").disabled = false;
+            document.getElementById("btnStop").disabled = true;
+            setupCamera();
+        }
+
+        // 🌟 ยิงข้อมูลพยานวิดีโอ Base64 และพิกัดจีพีเอส กลับหน้าจอแม่ Web App GAS
+        function dispatchTelemetry() {
+            if (!recordedBlob) return;
+            const btn = document.getElementById("btnConfirm");
+            btn.disabled = true;
+            btn.textContent = "⚙️ กำลังประมวลผล Payload...";
+
+            const reader = new FileReader();
+            reader.readAsDataURL(recordedBlob);
+            reader.onloadend = () => {
+                // ตรวจหา Mime Type จริงของภาพวิดีโอที่ได้จากอุปกรณ์ (iOS / Android)
+                let actualMime = recordedBlob.type || "video/webm";
+                let finalFilename = filename;
+                
+                // หากอุปกรณ์แปลงออกมาเป็น mp4 หรือ mov ให้ปรับปรุงหางสกุลไฟล์ปลายทางให้ถูกต้อง
+                if (actualMime.includes("mp4")) {
+                    finalFilename = filename.replace(".webm", ".mp4");
+                } else if (actualMime.includes("quicktime") || actualMime.includes("mov")) {
+                    finalFilename = filename.replace(".webm", ".mov");
+                }
+
+                const payload = {
+                    base64: reader.result,
+                    mimeType: actualMime,
+                    name: finalFilename,
+                    coords: activeCoords // ส่งพิกัด GPS กลับไปด้วยพร้อมข้อมูลมีเดีย
+                };
+                
+                if (window.opener) {
+                    window.opener.postMessage(payload, "*");
+                } else {
+                    alert("⚠️ ตรวจไม่พบหน้าต่างผู้รับต้นทาง กรุณาเปิดระบบคู่ขนานตามระบบ");
+                    btn.disabled = false;
+                    btn.textContent = "🚀 โอนข้อมูลข้ามโดเมน";
+                }
+            };
+        }
+
+        window.onload = setupCamera;
+    </script>
+</body>
+</html>
